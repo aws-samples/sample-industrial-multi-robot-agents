@@ -1,0 +1,1990 @@
+openapi: 3.1.0
+info:
+  title: Multi-Robots Agents — Dashboard & Orchestrator A2A API
+  version: 0.1.0
+  summary: |
+    HTTP surface for the two web-facing services in a cell deployment:
+
+      * the **dashboard** on port `8888`, which serves the operator UI and a
+        thin proxy layer over the orchestrator, and
+      * the **orchestrator A2A** on port `8889`, which is the machine-to-agent
+        entry point that plans, executes, replays and monitors runs.
+
+    The spec is hand-authored (the repo has no OpenAPI tooling; a static file
+    keeps the number of moving parts the same as before). `tests/test_openapi_spec.py`
+    holds this document and the routes actually served to each other by scanning
+    both server files for `@app.route(...)` declarations — an API description
+    nobody measures against the server is the one thing this project has learned
+    always drifts.
+  description: |
+    ## Runs
+
+    Anything that moves a robot is a **run** with an id (`{cell_id}_{YYYYMMDD}_{HHMMSS}`).
+    Pass `"async": true` and the orchestrator returns `202` with a run envelope
+    immediately, then poll `GET /a2a/result/{run_id}`; omit it and the call
+    blocks until the run finishes. One run at a time per cell — a second motion
+    command while one is already executing is refused with `409` (the busy
+    envelope names the run in the way), not interleaved.
+
+    ## HTTP status vs. `success`
+
+    HTTP status describes the **request**; the JSON `success` describes the
+    **cell**. A run that ran and failed is `200 OK` with `{"success": false, ...}`
+    (the request was served — the robot did not do the thing). `4xx`/`5xx` mean
+    the call never reached the cell.
+
+    ## Models
+
+    Every endpoint that reaches an LLM accepts an optional `model` — an alias
+    (`"opus-5"`), a full model id, or `"provider:model"`. `GET /a2a/models`
+    lists what is on offer; omit `model` and the startup default applies.
+
+    ## Dashboard proxies
+
+    `/api/a2a/*` on the dashboard forwards the body verbatim to the matching
+    orchestrator route and **relays the upstream HTTP status** — a `404`
+    upstream is a `404` downstream. This lets the operator UI (and any other
+    client) tell "the orchestrator refused this" from "here is your result".
+  contact:
+    name: See CLAUDE.md and CONTEXT.md at repository root
+  license:
+    name: See repository LICENSE
+
+servers:
+  - url: http://{host}:8888
+    description: Dashboard (operator UI + REST proxies)
+    variables:
+      host:
+        default: localhost
+        description: Host running the dashboard container
+  - url: http://{host}:8889
+    description: Orchestrator A2A (machine-to-agent entry)
+    variables:
+      host:
+        default: localhost
+        description: Host running the orchestrator container
+
+tags:
+  - name: dashboard
+    description: Dashboard-only routes (operator UI, WebSocket-style state polling, log stream)
+  - name: dashboard-proxy
+    description: Dashboard proxies over the orchestrator's A2A surface (status is relayed)
+  - name: a2a-run
+    description: Task execution — plan + execute a program on a cell
+  - name: a2a-run-control
+    description: Stop, replay, jog
+  - name: a2a-state
+    description: Cell state, plans, recordings
+  - name: a2a-runs
+    description: Which runs happened and how they went
+  - name: a2a-skills
+    description: Agent skills and their per-cell prioritisation
+
+paths:
+
+  # ─── Dashboard (:8888) ────────────────────────────────────────────────────
+  /:
+    get:
+      tags: [dashboard]
+      summary: Operator UI (HTML)
+      description: The single-page web control panel.
+      responses:
+        '200':
+          description: HTML document
+          content:
+            text/html:
+              schema: { type: string }
+
+  /wizard:
+    get:
+      tags: [dashboard]
+      summary: Task wizard UI (HTML)
+      description: |
+        The task-authoring wizard, opened in its own window by the Operator
+        tab's "Wizard" button. It asks for the program name, the planner, and
+        each operation point, then writes the task file through
+        `POST /api/a2a/task/save`. It commands no motion.
+      responses:
+        '200':
+          description: HTML document
+          content:
+            text/html:
+              schema: { type: string }
+
+  /health:
+    get:
+      tags: [dashboard]
+      summary: Dashboard liveness
+      description: |
+        Returns 200 whenever Flask is up. Also served (with a different body)
+        by the orchestrator; the two are separate services and both are
+        polled independently by ops.
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:        { type: boolean }
+                  cell_id:   { type: string }
+                  ros:       { type: boolean }
+                  cell_base: { type: string }
+
+  /api/topology:
+    get:
+      tags: [dashboard]
+      summary: Agent topology graph for the UI
+      responses:
+        '200':
+          description: Nodes and edges of the visualiser
+          content: { application/json: { schema: { type: object } } }
+
+  /api/state:
+    get:
+      tags: [dashboard]
+      summary: Live cell state (per-robot joints, EE, log recordings list)
+      responses:
+        '200':
+          description: A snapshot
+          content: { application/json: { schema: { type: object } } }
+
+  /api/command:
+    post:
+      tags: [dashboard]
+      summary: Buttons on the operator UI (planning / stop / reset / estop)
+      description: |
+        Not part of the A2A API. Four buttons, three different meanings of
+        "stop", and the differences are physical:
+
+        * `planning` — dispatches `/a2a/plan` for the SELECTED task program
+          (required; there is no default) and polls it. Plans only; no motion.
+        * `stop` — `/a2a/abort`: ends the system's ACTIVITY (a planning job, an
+          executing plan). Does not halt an arm; a trajectory a controller has
+          already accepted runs to its end.
+        * `reset` — `/a2a/reset`: `stop`, then drive the arms HOME. MOVES THE
+          ROBOTS and clears a latched e-stop to do it.
+        * `estop` — the emergency stop. Published straight to ROS rather than
+          through the orchestrator on purpose: a stop that depends on a healthy
+          orchestrator is not a stop. It halts the arms and LATCHES. Answers 503
+          when this panel has no ROS node, because nothing was published.
+
+        `status` is still accepted as a no-op round-trip probe for API clients,
+        but no control sends it — the panel polls `/api/state` every 1.5 s.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  enum: [planning, stop, reset, estop, status]
+                program:
+                  type: string
+                  description: "Task program to plan. REQUIRED for `planning`; ignored otherwise."
+      responses:
+        '200': { description: Accepted (see /api/state / logs for outcome) }
+        # Anything outside the enum. It used to be a 200 `{"ok": true}`, which made
+        # a button whose command string had drifted report success and do nothing.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '502': { description: "The orchestrator refused or could not be reached (stop/reset)" }
+        '503': { description: "`estop` could not be published — no ROS node in the panel" }
+
+  /api/speed:
+    post:
+      tags: [dashboard]
+      summary: Set the cell's velocity scale
+      description: |
+        The one owner of "how fast is this cell moving". The orchestrator's
+        `/a2a/replay` intentionally does not accept a speed — passing one there
+        would create a second, weaker knob on the same setting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scale]
+              properties:
+                scale: { type: number, minimum: 0.05, maximum: 4.0 }
+      responses:
+        '200': { description: Applied }
+
+  /api/replay:
+    post:
+      tags: [dashboard]
+      summary: Legacy replay hook used by the "Replay" button
+      description: Left in place for older UI builds; new callers should use `/api/a2a/replay`.
+      requestBody:
+        required: false
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200': { description: Accepted }
+
+  /api/chat:
+    post:
+      tags: [dashboard]
+      summary: Route a chat message to the LLM
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200': { description: Reply text }
+
+  /api/recordings:
+    get:
+      tags: [dashboard]
+      summary: List cell recordings (dashboard-local view)
+      responses: { '200': { description: List } }
+
+  /api/plans:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/plans — fills the behaviour-tree picker"
+      responses: { '200': { description: Listing } }
+
+  /api/plans/{tree_id}:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/plans/{tree_id} — the tree the panel draws"
+      description: |
+        `tree_id` is validated here before it reaches the orchestrator: the plan
+        store resolves it as a filename, so only `[A-Za-z0-9_.-]{1,128}` not
+        starting with `.` is forwarded.
+
+        A FAILED run answers `200` with `status: failed`, `executable: false` and
+        the failure — see `/a2a/plans/{tree_id}`. The BTree tab draws whatever
+        partial tree exists, says why it cannot run, and disables Replay.
+      parameters:
+        - { name: tree_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$' } }
+      responses:
+        '200': { description: Behaviour tree, or a failed run's evidence }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/plans/{tree_id}/quality:
+    get:
+      tags: [dashboard]
+      summary: "Trajectory-quality KPIs for one plan — the BTree tab's Performance card"
+      description: |
+        Asked of the **trajectory agent** over MCP (`get_plan_quality`), not of the
+        orchestrator: the metric definitions live in
+        `agents/trajectory/tools/trajectory_quality.py` and the report belongs to
+        the agent that owns them. The dashboard renders it and computes nothing.
+
+        `source` says where the numbers came from: `stored` is the report
+        `save_plan` wrote beside the plan, `computed` means this plan predates the
+        metrics and was scored on demand from the stored tree.
+
+        Answers `200` even when the report is unavailable — the body carries
+        `success: false` and the reason, because the card has to distinguish "not
+        measured, because X" from "measured badly". A FAILED run is refused rather
+        than scored: its legs are a fragment, and scoring one against a whole
+        program flatters a run for stopping early.
+
+        `safety` is reported and deliberately absent from `efficiency_score` and
+        `score_weights` — a score is a thing people optimise, and scoring
+        clearance would turn a safety margin into a tunable.
+      parameters:
+        - { name: tree_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$' } }
+      responses:
+        '200':
+          description: The quality report, or a refusal with its reason
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  cell_id: { type: string }
+                  tree_id: { type: string }
+                  source: { type: string, enum: [stored, computed] }
+                  efficiency_score: { type: number }
+                  verdict: { type: string, enum: [good, acceptable, poor] }
+                  score_components: { type: object }
+                  score_weights: { type: object }
+                  summary: { type: object }
+                  schedule: { type: object }
+                  continuity: { type: object }
+                  legs: { type: array, items: { type: object } }
+                  safety: { type: object }
+                  findings: { type: array, items: { type: object } }
+                  error: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/plans/{tree_id}/nodes/{node_id}:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/plans/{tree_id}/nodes/{node_id} — descend into a leaf"
+      parameters:
+        - { name: tree_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$' } }
+        - { name: node_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_.-]{1,128}$' } }
+      responses:
+        '200': { description: Node detail with waypoints }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/preview:
+    post:
+      tags: [dashboard]
+      summary: Show one node's motion on the RViz ghost arm — commands nothing
+      description: |
+        Step-through debugging without moving the cell. The node's waypoints are
+        published as JSON on `/{cell}/node_preview`, which **only the viewer
+        subscribes to**: it drives a translucent second copy of the arm
+        (`docker/launch_viz.py` → `GHOST_SUFFIX`). No robot agent listens to that
+        topic, no `FollowJointTrajectory` goal is sent, and no cell state changes —
+        so this is safe to call at any time, including mid-run, and it cannot be
+        used to drive the cell. `commanded` is always `false` in the reply.
+
+        `phase_index` narrows the preview to one phase segment of the node;
+        `waypoint_index` (applied after `phase_index`) holds the ghost at one exact
+        pose. Times are re-based to zero so a mid-motion phase starts immediately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_id]
+              properties:
+                tree_id: { type: string, default: latest }
+                node_id: { type: string }
+                phase_index: { type: integer, nullable: true }
+                waypoint_index: { type: integer, nullable: true }
+                speed: { type: number, default: 1.0, exclusiveMinimum: 0 }
+                loop: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Preview published to the ghost
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  tree_id: { type: string }
+                  node_id: { type: string }
+                  robot_ns: { type: string }
+                  label: { type: string }
+                  waypoints: { type: integer }
+                  duration_s: { type: number }
+                  commanded:
+                    type: boolean
+                    description: Always false — a preview never commands the cell
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: This panel has no ROS node, so it cannot reach the ghost }
+
+  /api/preview/clear:
+    post:
+      tags: [dashboard]
+      summary: Park every ghost arm back on its real arm
+      responses:
+        '200': { description: Cleared }
+        '503': { description: This panel has no ROS node }
+
+  /api/loop:
+    post:
+      tags: [dashboard]
+      summary: Start/stop the replay loop demo
+      requestBody: { content: { application/json: { schema: { type: object } } } }
+      responses: { '200': { description: Accepted } }
+
+  # ─── Dashboard proxies to the A2A surface ─────────────────────────────────
+  /api/a2a/run:
+    post:
+      tags: [dashboard-proxy, a2a-run]
+      summary: "Proxy: POST /a2a/run (always async from the dashboard)"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RunTaskRequest' } } }
+      responses:
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+        '502': { $ref: '#/components/responses/UpstreamUnreachable' }
+
+  /api/a2a/stop:
+    post:
+      tags: [dashboard-proxy, a2a-run-control]
+      summary: "Proxy: POST /a2a/stop"
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/StopRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/StopResult' }
+        '502': { $ref: '#/components/responses/UpstreamUnreachable' }
+
+  /api/a2a/status:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/status"
+      responses: { '200': { description: Live per-robot state } }
+
+  /api/a2a/runs:
+    get:
+      tags: [dashboard-proxy, a2a-runs]
+      summary: "Proxy: GET /a2a/runs"
+      responses: { '200': { $ref: '#/components/responses/RunsList' } }
+
+  /api/a2a/result/{run_id}:
+    get:
+      tags: [dashboard-proxy, a2a-runs]
+      summary: "Proxy: GET /a2a/result/{run_id}"
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/RunEnvelopeOK' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/a2a/reasoning:
+    get:
+      tags: [dashboard-proxy, a2a-runs]
+      summary: "Proxy: GET /a2a/reasoning"
+      parameters:
+        - name: run_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/ReasoningTrace' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/a2a/plan_traces:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/plan_traces — the Plan Log tab's history picker"
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50 }
+      responses: { '200': { description: Recorded planning runs, newest first } }
+
+  /api/a2a/plan_trace/{trace_id}:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/plan_trace/{trace_id} ('latest' accepted)"
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: One run's decisions, indexed per weld point }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/a2a/plan_events:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/plan_events — the Agents tab's live activity feed"
+      description: >
+        Polled with `since` = the previous reply's `next_seq`, so each call returns
+        only what is new. Backs the feed under the agent schema.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: integer, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 200 }
+        - name: trace_id
+          in: query
+          required: false
+          schema: { type: string, description: 'A specific run; omit for the newest' }
+      responses: { '200': { description: Events after `since`, oldest first } }
+
+  /api/plan_progress:
+    get:
+      tags: [dashboard]
+      summary: "The live planning feed as it arrives on DDS"
+      description: >
+        The planner publishes every plan event as `std_msgs/String` JSON on
+        `/{cell_id}/plan_progress`; the panel's own ROS node buffers them, so this
+        route answers from memory instead of hopping through the orchestrator and
+        a shared volume. Same response shape as `/api/a2a/plan_events` plus
+        `available`: when it is not `true` this panel has no DDS feed (no ROS node,
+        or nothing published yet for this cell) and the caller must fall back to
+        `/api/a2a/plan_events`, which is the durable record and the only source
+        that answers a reader arriving after the run.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: integer, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 200 }
+      responses:
+        '200':
+          description: >
+            Events after `since`, oldest first, with `available`, `running`,
+            `next_seq`, `trace_id`, `topic` and `dropped`.
+        '400': { description: since or limit was not an integer }
+
+  /api/a2a/checkpoints:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/checkpoints — runs that can be resumed"
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50 }
+      responses: { '200': { description: Saved checkpoints, newest first } }
+
+  /api/a2a/plan/pause:
+    post:
+      tags: [dashboard-proxy, a2a-run-control]
+      summary: "Proxy: POST /a2a/plan/pause — pause planning, keeping its work"
+      description: >
+        Not Stop. `/api/a2a/stop` discards the run; this keeps every solved
+        trajectory and the model's conversation so `/api/a2a/plan/resume` continues
+        at the next unplanned operation.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tree_id: { type: string, description: 'Omit to pause every active run' }
+                reason:  { type: string }
+      responses: { '200': { description: Pause requested (cooperative; lands a step later) } }
+
+  /api/a2a/plan/resume:
+    post:
+      tags: [dashboard-proxy, a2a-run-control]
+      summary: "Proxy: POST /a2a/plan/resume — continue a checkpointed run"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tree_id]
+              properties:
+                tree_id: { type: string }
+                model:   { type: string }
+      responses:
+        '200': { description: Accepted; the run continues in the background }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: Nothing resumable for that tree_id }
+
+  /api/a2a/move:
+    post:
+      tags: [dashboard-proxy, a2a-run-control]
+      summary: "Proxy: POST /a2a/move (dashboard always dispatches async)"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MoveRequest' } } }
+      responses:
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /api/a2a/task/save:
+    post:
+      tags: [dashboard-proxy]
+      summary: "Proxy: POST /a2a/task/save — write the task file, run nothing"
+      description: |
+        What the task wizard calls when the operator presses "Write task file".
+        No run is registered and no robot is commanded, so there is no 409-busy
+        answer here: authoring is safe while the cell is working.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskSubmitRequest' } } }
+      responses:
+        '200':
+          description: Written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:        { type: boolean }
+                  saved:          { type: string }
+                  program:        { type: string }
+                  cell_id:        { type: string }
+                  num_operations: { type: integer }
+                  commanded:      { type: boolean, const: false }
+                  ran:            { type: boolean, const: false }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: A program of that name exists and `overwrite` was not set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/a2a/task/submit:
+    post:
+      tags: [dashboard-proxy, a2a-run]
+      summary: "Proxy: POST /a2a/task/submit"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskSubmitRequest' } } }
+      responses:
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /api/a2a/replay:
+    post:
+      tags: [dashboard-proxy, a2a-run-control]
+      summary: "Proxy: POST /a2a/replay"
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReplayRequest' } } }
+      responses:
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /api/a2a/recordings:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/recordings"
+      responses: { '200': { $ref: '#/components/responses/RecordingsList' } }
+
+  /api/a2a/recordings/{tree_id}:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/recordings/{tree_id}"
+      parameters:
+        - name: tree_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Recording metadata }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/a2a/tasks:
+    get:
+      tags: [dashboard-proxy, a2a-state]
+      summary: "Proxy: GET /a2a/tasks"
+      responses:
+        '200': { $ref: '#/components/responses/TasksList' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ─── Orchestrator A2A (:8889) ─────────────────────────────────────────────
+  /a2a/planners:
+    get:
+      tags: [a2a-state]
+      summary: The planners planning runs are distributed to, and what each is doing
+      description: |
+        Each trajectory-agent container runs ONE planning run at a time and registers
+        itself here. POST /a2a/plan gives a new run to a free planner (or answers
+        `no_free_planner`); a run's status, pause, resume and cancel go to the planner
+        that owns it.
+      responses:
+        '200':
+          description: Planner registry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  free: { type: integer }
+                  planners:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        planner_id: { type: string }
+                        mcp_url: { type: string }
+                        live: { type: boolean }
+                        busy: { type: [boolean, "null"] }
+                        active: { type: [object, "null"] }
+                        backends: { type: array, items: { type: string } }
+                        last_seen: { type: [number, "null"] }
+                        static: { type: boolean }
+
+  /a2a/planners/register:
+    post:
+      tags: [a2a-state]
+      summary: A planner registers itself, and heartbeats, for planning distribution
+      description: |
+        Sent by every trajectory-agent at start-up and every PLANNER_HEARTBEAT_S. A
+        planner that misses a few heartbeats is no longer given new runs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planner_id, mcp_url]
+              properties:
+                planner_id: { type: string }
+                mcp_url: { type: string }
+                busy: { type: boolean }
+                active: { type: [object, "null"] }
+                backends: { type: array, items: { type: string } }
+                heartbeat_s: { type: number }
+      responses:
+        '200':
+          description: Registered
+        '400':
+          description: No planner_id, or no http(s) mcp_url
+
+  /a2a/models:
+    get:
+      tags: [a2a-state]
+      summary: Which LLMs the orchestrator will accept in a `model` field
+      responses:
+        '200':
+          description: Model catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  aliases:
+                    type: object
+                    additionalProperties: { type: string }
+                  default: { type: string }
+
+  /a2a/skills:
+    get:
+      tags: [a2a-skills]
+      summary: List agent skills with their effective priority for a cell
+      description: |
+        Skills live in `skills/<agent>/<name>/SKILL.md`. Default priority is the
+        frontmatter's `metadata.priority` (0-100, higher = preferred, 50 when
+        absent); a cell's `config/skills.yaml` overrides it. Sorted highest
+        priority first within each agent. Proxies the trajectory MCP tool
+        `list_skills`.
+      parameters:
+        - { name: cell_id, in: query, schema: { type: string } }
+        - { name: agent, in: query, schema: { type: string, enum: [trajectory, trajectory-classic, cell, orchestrator] } }
+        - { name: include_disabled, in: query, schema: { type: boolean, default: true } }
+      responses:
+        '200':
+          description: Skill catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  cell_id: { type: string }
+                  count:   { type: integer }
+                  skills:  { type: array, items: { $ref: '#/components/schemas/Skill' } }
+        '400': { description: Unknown agent }
+        '502': { description: Trajectory agent unreachable }
+
+  /a2a/skills/{agent}/{name}:
+    get:
+      tags: [a2a-skills]
+      summary: One skill's metadata and full SKILL.md text
+      parameters:
+        - { name: agent, in: path, required: true, schema: { type: string, enum: [trajectory, trajectory-classic, cell, orchestrator] } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: cell_id, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: The skill
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Skill'
+                  - type: object
+                    properties:
+                      success: { type: boolean }
+                      content: { type: string, description: Full SKILL.md text }
+        '400': { description: Unknown agent or skill }
+        '502': { description: Trajectory agent unreachable }
+
+  /a2a/skills/template:
+    get:
+      tags: [a2a-skills]
+      summary: An example skill, its fields and limits, and example plan requests
+      description: |
+        A complete SKILL.md that validates as a temporary skill, the names already
+        taken, the limits, and request bodies for POST /a2a/plan that add a
+        temporary skill, disable / re-prioritise skills, or adjust the prompt.
+        Proxies the trajectory MCP tool `skill_template`.
+      parameters:
+        - { name: agent, in: query, schema: { type: string, enum: [trajectory, trajectory-classic], default: trajectory } }
+      responses:
+        '200':
+          description: The template
+          content: { application/json: { schema: { type: object } } }
+        '400': { description: Unknown agent }
+        '502': { description: Trajectory agent unreachable }
+
+  /a2a/skills/validate:
+    post:
+      tags: [a2a-skills]
+      summary: Check temporary skills before planning with them
+      description: |
+        The same check POST /a2a/plan applies to `run_skills`; nothing is stored.
+        Proxies the trajectory MCP tool `validate_run_skills`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_skills]
+              properties:
+                run_skills: { type: array, items: { $ref: '#/components/schemas/RunSkill' } }
+                agent:      { type: string, enum: [trajectory, trajectory-classic], default: trajectory }
+      responses:
+        '200':
+          description: Valid — their canonical form
+          content: { application/json: { schema: { type: object } } }
+        '400': { description: "Refused: `error` says which skill and why" }
+        '502': { description: Trajectory agent unreachable }
+
+  /a2a/skills/priority:
+    post:
+      tags: [a2a-skills]
+      summary: Set a skill's per-cell priority and/or enabled flag
+      description: |
+        Written to the cell's `config/skills.yaml`; applies from the next planning
+        run. Skills marked `required` (collision validation) cannot be disabled.
+        `reset: true` drops the override so the frontmatter default applies.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent, name]
+              properties:
+                cell_id:  { type: string }
+                agent:    { type: string, enum: [trajectory, trajectory-classic, cell, orchestrator] }
+                name:     { type: string }
+                priority: { type: integer, minimum: 0, maximum: 100 }
+                enabled:  { type: boolean }
+                reset:    { type: boolean }
+      responses:
+        '200':
+          description: The skill as it now stands
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  cell_id: { type: string }
+                  skill:   { $ref: '#/components/schemas/Skill' }
+        '400': { description: Bad agent/skill/priority, or disabling a required skill }
+        '502': { description: Trajectory agent unreachable }
+
+  /a2a/tasks:
+    get:
+      tags: [a2a-state]
+      summary: List the task programs defined for a cell
+      description: |
+        Delegates to `read_cell_spec`, which owns "what programs does this
+        cell have?" so the two answers can't drift.
+      parameters:
+        - name: cell_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/TasksList' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /a2a/run:
+    post:
+      tags: [a2a-run]
+      summary: Plan and execute a program on a cell
+      description: |
+        Sync by default (returns when the run has finished); pass `"async": true`
+        for `202` + a run envelope, then poll `GET /a2a/result/{run_id}`.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RunTaskRequest' } } }
+      responses:
+        '200':
+          description: "Run finished. `success: false` means it ran and failed."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunResultSync' }
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+        '500': { $ref: '#/components/responses/RunError' }
+
+  /a2a/task/save:
+    post:
+      tags: [a2a-run]
+      summary: Persist a task program and run NOTHING
+      description: |
+        The authoring half of `POST /a2a/task/submit`: identical body, identical
+        validation, identical destination (`cells/{cell_id}/tasks/{program}.json`)
+        — but no run is started and no robot is commanded. Writing a program and
+        moving the arms are separate decisions; the panel's task wizard authors
+        here, and planning (`POST /a2a/plan`) or running (`POST /a2a/run`) stays
+        an explicit later call. Because nothing is dispatched, this never answers
+        409-busy — only 409 "that program already exists" (pass `overwrite: true`
+        to replace it).
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskSubmitRequest' } } }
+      responses:
+        '200':
+          description: Written
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, saved, program, cell_id, commanded, ran]
+                properties:
+                  success:        { type: boolean }
+                  saved:          { type: string, description: absolute path of the file written }
+                  program:        { type: string }
+                  cell_id:        { type: string }
+                  num_operations: { type: integer }
+                  commanded:      { type: boolean, const: false }
+                  ran:            { type: boolean, const: false }
+                  hint:           { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: A program of that name exists and `overwrite` was not set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /a2a/task/submit:
+    post:
+      tags: [a2a-run]
+      summary: Persist a task program to the cell and run it
+      description: |
+        The authoring shortcut. The program is written to
+        `cells/{cell_id}/tasks/{program}.json` **before** it is dispatched, so
+        what ran is diffable and re-runnable. An existing program is *not*
+        overwritten unless `overwrite: true` — this endpoint refuses to be the
+        only thing standing between a submit and a hand-authored program.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskSubmitRequest' } } }
+      responses:
+        '200':
+          description: Sync run finished
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RunResultSync'
+                  - type: object
+                    properties: { saved: { type: string } }
+        '202':
+          description: Async dispatched
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RunEnvelope'
+                  - type: object
+                    properties: { saved: { type: string } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Program already exists, or the cell is already busy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /a2a/plan:
+    post:
+      tags: [a2a-run-control]
+      summary: Plan a task program — calculate trajectories, move nothing
+      description: |
+        The half of `/a2a/run` that stops before dispatch: the finished
+        BehaviourTree is persisted for the cell and NOTHING reaches a robot.
+        Executing it is a separate, deliberate act (`/a2a/replay`).
+
+        It still takes the cell's single run slot, because planning is long and
+        two agents planning one cell at once is not a thing anyone wants — a
+        second request gets 409.
+
+        Planning takes minutes: prefer `async: true` and poll
+        `/a2a/result/{run_id}`, or stop it with `/a2a/abort`.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PlanRequest' } } }
+      responses:
+        '200':
+          description: "Planning finished (`success` false ⇒ it ran and failed or was cancelled)"
+          content: { application/json: { schema: { type: object } } }
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { description: "No such program for this cell (see GET /a2a/tasks)" }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /a2a/abort:
+    post:
+      tags: [a2a-run-control]
+      summary: Stop what the system is DOING (planning, executing) — not the arms
+      description: |
+        The software stop, in both places activity can live: a planning job is
+        cancelled cooperatively in the trajectory agent, and an executing
+        behaviour tree stops dispatching nodes in the cell controller.
+
+        IT DOES NOT HALT AN ARM. A trajectory already accepted by a controller
+        runs to its end, so an arm mid-motion finishes that motion and then
+        stops. Use `/a2a/stop` to halt the arms where they are.
+
+        Idempotent and never an error when idle: `cancelled: []` and
+        `aborted: false`.
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/StopRequest' } } }
+      responses:
+        '200':
+          description: "Both halves attempted; see `planning` and `execution`"
+          content: { application/json: { schema: { type: object } } }
+
+  /a2a/reset:
+    post:
+      tags: [a2a-run-control]
+      summary: Abort the activity, then send the arms HOME (moves the robots)
+      description: |
+        `/a2a/abort` followed by the cell's gated `home_robots`: the returns are
+        planned for all arms together and then measured, so arms that cannot go
+        home clear of each other are homed one at a time, and an arm that cannot
+        be cleared in any order is LEFT WHERE IT STANDS and reported.
+
+        Two consequences worth knowing before calling it: it CLEARS A LATCHED
+        E-STOP (execution must, or every dispatch would be rejected and this
+        would report a hollow success), and homing begins only after the
+        in-flight trajectory finishes, because the abort is not a halt.
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/ResetRequest' } } }
+      responses:
+        '200':
+          description: Homing finished
+          content: { application/json: { schema: { type: object } } }
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /a2a/stop:
+    post:
+      tags: [a2a-run-control]
+      summary: Trigger the cell-wide emergency stop
+      description: |
+        There is no gentler stop, and this endpoint deliberately does not
+        invent one: the robot agents honour exactly one halt signal (the
+        e-stop the cell controller publishes), so a second, weaker "stop"
+        here would be observed by some executors and not others.
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/StopRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/StopResult' }
+
+  /a2a/replay:
+    post:
+      tags: [a2a-run-control]
+      summary: Replay a previously calculated plan (no re-planning)
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReplayRequest' } } }
+      responses:
+        '200':
+          description: Sync replay finished
+          content: { application/json: { schema: { $ref: '#/components/schemas/RunResultSync' } } }
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /a2a/move:
+    post:
+      tags: [a2a-run-control]
+      summary: Jog one robot — joint angles OR a world-frame point
+      description: |
+        NOT a planned motion. Straight joint interpolation with no path
+        planning and no inter-robot collision checking; the response says so
+        in `collision_checked: false`. Use `/a2a/run` for anything that has
+        to be collision-free. Speed is `duration_s` (what `move_robot`
+        actually implements) rather than a velocity scale.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MoveRequest' } } }
+      responses:
+        '200':
+          description: Sync move finished
+          content: { application/json: { schema: { $ref: '#/components/schemas/RunResultSync' } } }
+        '202': { $ref: '#/components/responses/RunAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/CellBusy' }
+
+  /a2a/status:
+    get:
+      tags: [a2a-state]
+      summary: Live per-robot joints + EE positions
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses:
+        '200': { description: Snapshot }
+
+  /a2a/plans:
+    get:
+      tags: [a2a-state]
+      summary: List previously calculated behaviour trees for a cell
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses: { '200': { description: Listing } }
+
+  /a2a/plans/{tree_id}:
+    get:
+      tags: [a2a-state]
+      summary: One calculated behaviour tree, without its waypoint blackboard
+      description: |
+        The tree the dashboard draws. The `blackboard` (every planned trajectory,
+        tens of thousands of joint samples) and the duplicate `xml` rendering are
+        stripped; `trajectory_sizes` gives the waypoint count behind each
+        `"{key}"` port reference instead, so the response size is set by the
+        number of nodes rather than by the length of the motion.
+
+        `tree_id` may be `latest` for the most recently calculated plan.
+
+        **A FAILED run is readable here.** `GET /a2a/plans` lists failed runs on
+        purpose — a token that expired at weld 13 says nothing about welds 1-12 —
+        so this reader opens them too, marked `status: failed` and
+        `executable: false` with the failure beside them. A run that stopped before
+        assembling anything answers `200` with `behaviour_tree: null` and the
+        evidence, not `404`: there IS such a plan, it just cannot run. `404` still
+        means no such plan. Execution is unaffected — `POST /a2a/replay` loads
+        without `include_failed`, and the cell's `replay_plan` refuses a failed
+        record outright.
+      parameters:
+        - { name: tree_id, in: path, required: true, schema: { type: string } }
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses:
+        '200':
+          description: Behaviour tree, or a failed run's evidence
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, description: The READ succeeded }
+                  cell_id: { type: string }
+                  tree_id: { type: string }
+                  num_operations: { type: integer }
+                  status:
+                    type: string
+                    enum: [ok, failed]
+                  executable:
+                    type: boolean
+                    description: False for a failed run — evidence, not a plan to run
+                  error: { type: string, nullable: true }
+                  error_kind: { type: string, nullable: true }
+                  resumable:
+                    type: boolean
+                    description: Whether `POST /a2a/plan/resume` can continue it
+                  failures:
+                    type: array
+                    description: Per-operation failures (failed runs only)
+                    items: { type: object }
+                  trajectory_sizes:
+                    type: object
+                    description: Waypoints per blackboard key, kept server-side
+                    additionalProperties: { type: integer }
+                  behaviour_tree:
+                    type: object
+                    nullable: true
+                    description: >-
+                      BehaviorTree.CPP v4 tree, `root` plus metadata. Null when the
+                      run failed before assembling one.
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /a2a/plan_traces:
+    get:
+      tags: [a2a-state]
+      summary: Planning runs whose decision trace was recorded, newest first
+      description: |
+        The history list. Metadata only — one row per planning run: when it ran, on
+        which model and backend, how it ended, how many decisions it took and how
+        its weld points came out (`points_by_status`).
+
+        Traces are read off the cell's shared logs volume, so a run recorded by the
+        trajectory agent is servable here and survives the container.
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        '200':
+          description: Trace listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  cell_id: { type: string }
+                  traces:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        trace_id:   { type: string }
+                        tree_id:    { type: string, nullable: true }
+                        model:      { type: string, nullable: true }
+                        backend:    { type: string, nullable: true }
+                        started_at: { type: string }
+                        elapsed_s:  { type: number, nullable: true }
+                        success:    { type: boolean }
+                        error_kind: { type: string, nullable: true }
+                        tool_calls: { type: integer }
+                        points:     { type: integer }
+                        decisions:  { type: integer }
+                        points_by_status:
+                          type: object
+                          additionalProperties: { type: integer }
+
+  /a2a/plan_trace/{trace_id}:
+    get:
+      tags: [a2a-state]
+      summary: One planning run's decisions, indexed per weld point
+      description: |
+        One history in two views. `points` lists every operation in the task — the
+        ones nothing was ever decided about included, because a weld the planner
+        silently skipped is a finding — each with the sequence numbers of the
+        decisions that touched it, its rolled-up metrics and its verdict. `decisions`
+        is every tool call in order, each carrying the reasoning that preceded it
+        (`why`), its arguments, and its result.
+
+        Waypoint arrays are summarised to `{waypoints, duration_s}`: the counts a
+        reader needs, without the megabytes.
+
+        `trace_id` may be `latest` for the most recently recorded run.
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string } }
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses:
+        '200':
+          description: Structured planning trace
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  schema:  { type: string, description: 'Trace format, e.g. `plan_trace/1`' }
+                  run:     { type: object }
+                  points:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        operation_id: { type: string }
+                        type:         { type: string, nullable: true }
+                        position:     { type: array, items: { type: number }, nullable: true }
+                        robot:        { type: string, nullable: true }
+                        status:
+                          type: string
+                          description: The LAST verdict recorded, not the best one
+                          enum: [pending, planned, validated, in_tree, failed]
+                        attempts:  { type: integer }
+                        decisions: { type: array, items: { type: integer } }
+                        metrics:   { type: object }
+                        failures:  { type: array, items: { type: object } }
+                  decisions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq:  { type: integer }
+                        kind: { type: string, enum: [decision, note] }
+                        step: { type: integer }
+                        tool: { type: string }
+                        why:  { type: string }
+                        args: { type: object }
+                        operations: { type: array, items: { type: string } }
+                        robots:     { type: array, items: { type: string } }
+                        result:     { type: object }
+        '400': { description: trace_id is not a plain identifier }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /a2a/plan_events:
+    get:
+      tags: [a2a-state]
+      summary: The live feed of a planning run — what it is doing, as it does it
+      description: |
+        `/a2a/plan_trace/{trace_id}` answers "what happened in that run", after the
+        fact. This answers "what is it doing now", while a run that takes minutes is
+        still going: this weld started, that trajectory was computed, a validation
+        failed, the planner re-attempted an operation with a different standoff (a
+        `strategy` event, carrying the changed values), the run paused.
+
+        **Poll it incrementally.** Pass the previous reply's `next_seq` as `since`
+        and you get only what is new, so following a run costs one short response
+        per tick rather than the whole run each time. `events` empty with an
+        unchanged `next_seq` means nothing has happened since.
+
+        `running` is false once a terminal event (`finished` / `aborted` / `paused`)
+        is in the stream. Events are read off the cell's shared logs volume, so a
+        run recorded by the trajectory agent is servable here and survives the
+        container that produced it.
+
+        When a poll falls behind, the NEWEST events are kept and `dropped` says how
+        many older ones were left out — a live feed should show the present.
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+        - { name: trace_id, in: query, required: false, schema: { type: string, description: 'A specific run; omit for the newest' } }
+        - { name: since, in: query, required: false, schema: { type: integer, default: 0, description: 'Return events with seq greater than this' } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 1000 } }
+      responses:
+        '200':
+          description: Events after `since`, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:  { type: boolean }
+                  cell_id:  { type: string }
+                  trace_id: { type: string, nullable: true }
+                  next_seq: { type: integer, description: 'Pass as `since` on the next poll' }
+                  dropped:  { type: integer }
+                  running:  { type: boolean }
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq:  { type: integer }
+                        at:   { type: string }
+                        kind:
+                          type: string
+                          enum: [run_started, resumed, think, operation_started,
+                                 operation_planned, operation_validated,
+                                 operation_failed, strategy, tool_started,
+                                 tool_failed, paused, checkpoint, aborted, finished]
+                        text: { type: string, description: 'One-line rendering, ready to display' }
+                        operation_id: { type: string, nullable: true }
+                        robot:        { type: string, nullable: true }
+                        tool:         { type: string, nullable: true }
+                        changed:
+                          type: object
+                          nullable: true
+                          description: 'On `strategy`: `{arg: [before, after]}` — the evidence'
+        '400': { description: since/limit are not integers, or trace_id is not a plain identifier }
+
+  /a2a/checkpoints:
+    get:
+      tags: [a2a-state]
+      summary: Planning runs that can be CONTINUED instead of restarted
+      description: |
+        A checkpoint exists only while its run has somewhere left to go: it is
+        written when a run pauses or is interrupted (expired token, dropped socket,
+        truncated reply, exhausted step budget), and deleted the moment the run
+        produces a tree. So every entry with `resumable: true` is work that would
+        otherwise have to be redone — `trajectories` says how many solved motions a
+        resume would recover.
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        '200':
+          description: Checkpoints, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:   { type: boolean }
+                  cell_id:   { type: string }
+                  count:     { type: integer }
+                  resumable: { type: integer }
+                  checkpoints:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        tree_id:      { type: string }
+                        saved_at:     { type: string }
+                        reason:       { type: string }
+                        resumable:    { type: boolean }
+                        step:         { type: integer }
+                        operations:   { type: integer }
+                        trajectories: { type: integer, description: 'Solved motions a resume recovers' }
+                        discarded:    { type: integer, description: 'In-flight messages trimmed to reach a valid boundary' }
+                        backend:      { type: string, nullable: true }
+                        model:        { type: string, nullable: true }
+
+  /a2a/plan/pause:
+    post:
+      tags: [a2a-run-control]
+      summary: Pause a planning run, keeping everything it has computed
+      description: |
+        **Not `/a2a/abort`.** Abort throws the run away and the next attempt starts
+        at the first weld. Pause writes the run's place to disk — the model's
+        conversation plus every trajectory already solved — and stops at the next
+        clean step boundary, so `POST /a2a/plan/resume` continues from there. Use it
+        before a token expires or a container has to be recreated.
+
+        Pausing commands no robot: planning is computation. It cannot halt an arm
+        either — `POST /a2a/stop` trips the latching e-stop for that.
+
+        Cooperative, so this returns immediately and the job reaches
+        `status: paused` a step later. At most that one in-flight step is replayed
+        on resume, never the run. Pausing an idle stack is not an error.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cell_id: { type: string }
+                tree_id: { type: string, description: 'Omit to pause every active run' }
+                reason:  { type: string }
+      responses:
+        '200':
+          description: Pause requested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  cell_id: { type: string }
+                  reason:  { type: string }
+                  paused:  { type: array, items: { type: string }, description: 'Empty when nothing was planning — not an error' }
+                  still_planning: { type: array, items: { type: string } }
+
+  /a2a/plan/resume:
+    post:
+      tags: [a2a-run-control]
+      summary: Continue a paused or interrupted planning run from its checkpoint
+      description: |
+        The recovery path for the failures that are not the cell's fault — an
+        expired token, a dropped socket, a truncated reply, an exhausted step
+        budget, an operator's pause. The run keeps its conversation and its solved
+        trajectories and carries on at the next unplanned operation.
+
+        ASYNCHRONOUS, like `POST /a2a/plan`: the run continues in the background
+        under the SAME `tree_id`, appending to the same event stream. Watch it with
+        `GET /a2a/plan_events` and fetch it with `GET /a2a/plans/{tree_id}`.
+
+        The operation list comes from the checkpoint, not from the caller, so a
+        resume cannot be pointed at a different set of welds.
+
+        A run with no resumable checkpoint is REFUSED with 409 rather than quietly
+        restarted — `GET /a2a/checkpoints` lists what can be resumed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tree_id]
+              properties:
+                cell_id: { type: string }
+                tree_id: { type: string }
+                model:   { type: string, description: 'Optional different LLM for the remainder' }
+      responses:
+        '200':
+          description: Accepted; the run continues in the background
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:  { type: boolean }
+                  tree_id:  { type: string }
+                  cell_id:  { type: string }
+                  status:   { type: string, enum: [planning] }
+                  resumed_from_step:     { type: integer }
+                  trajectories_restored: { type: integer }
+                  discarded_steps:       { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: No resumable checkpoint for that tree_id }
+
+  /a2a/plans/{tree_id}/nodes/{node_id}:
+    get:
+      tags: [a2a-state]
+      summary: One node of a plan, with its waypoints and phase segments
+      description: |
+        The only endpoint that ships joint samples out of a plan, and it ships
+        exactly one node's worth — a couple of hundred, whatever the size of the
+        plan — so descending into a leaf costs the same on a 200-weld tree as on a
+        two-leaf one. `GET /a2a/plans/{tree_id}` strips them all.
+
+        `phase_segments` are consecutive runs of the same waypoint `phase`
+        (`transit` / `approach`, set by the OMPL planner). The **executor ignores
+        `phase` entirely** — it reads only `positions` and `time_s` — so these
+        segments are for reading a motion, not for driving one.
+
+        A control node (`Sequence` / `Parallel`) has no trajectory: it answers with
+        its children's ids and empty segments.
+      parameters:
+        - { name: tree_id, in: path, required: true, schema: { type: string } }
+        - { name: node_id, in: path, required: true, schema: { type: string } }
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses:
+        '200':
+          description: Node detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  tree_id: { type: string }
+                  node_id: { type: string }
+                  type: { type: string, description: 'e.g. ExecuteTrajectory, MoveHome, Parallel' }
+                  name: { type: string, nullable: true }
+                  ports: { type: object, additionalProperties: true }
+                  children:
+                    type: array
+                    items: { type: string, nullable: true }
+                  duration_s: { type: number }
+                  phase_segments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        phase: { type: string }
+                        start_index: { type: integer }
+                        end_index: { type: integer }
+                        start_s: { type: number }
+                        end_s: { type: number }
+                        points: { type: integer }
+                  waypoints:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        positions:
+                          type: array
+                          items: { type: number }
+                        time_s: { type: number }
+                        phase: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /a2a/recordings:
+    get:
+      tags: [a2a-state]
+      summary: List `.rrd` execution recordings stored for a cell
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses: { '200': { $ref: '#/components/responses/RecordingsList' } }
+
+  /a2a/recordings/{tree_id}:
+    get:
+      tags: [a2a-state]
+      summary: Metadata for one recording, by `tree_id`
+      parameters:
+        - { name: tree_id, in: path, required: true, schema: { type: string } }
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses:
+        '200': { description: Entry }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /a2a/runs:
+    get:
+      tags: [a2a-runs]
+      summary: Runs this orchestrator knows about, newest first
+      description: |
+        Merges the live registry with the on-disk logs so a restart does not
+        make a cell's history disappear. Live entries win on `run_id`.
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+        - { name: limit,   in: query, required: false, schema: { type: integer, minimum: 1, maximum: 500 } }
+      responses:
+        '200': { $ref: '#/components/responses/RunsList' }
+
+  /a2a/result/{run_id}:
+    get:
+      tags: [a2a-runs]
+      summary: Poll one run
+      parameters:
+        - { name: run_id,  in: path,  required: true,  schema: { type: string } }
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/RunEnvelopeOK' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /a2a/reasoning:
+    get:
+      tags: [a2a-runs]
+      summary: LLM reasoning + action trace of a run
+      description: |
+        Read from the persisted run log, so the trace is available once the
+        run has finished. A run still executing returns
+        `status: "running"` with no entries rather than a guessed partial trace.
+      parameters:
+        - { name: cell_id, in: query, required: false, schema: { type: string } }
+        - { name: run_id,  in: query, required: false, schema: { type: string, description: "Defaults to the newest run for the cell" } }
+        - { name: limit,   in: query, required: false, schema: { type: integer, minimum: 1, maximum: 2000, default: 200, description: "Last N entries" } }
+      responses:
+        '200': { $ref: '#/components/responses/ReasoningTrace' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+# ─── Components ──────────────────────────────────────────────────────────────
+components:
+
+  responses:
+
+    RunAccepted:
+      description: Run dispatched. Poll `/a2a/result/{run_id}`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RunEnvelope' }
+
+    RunEnvelopeOK:
+      description: Envelope for one run
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RunEnvelope' }
+
+    RunsList:
+      description: Runs newest first, plus the currently active run for the cell (if any)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:  { type: boolean }
+              cell_id:  { type: string }
+              runs:
+                type: array
+                items: { $ref: '#/components/schemas/RunEnvelope' }
+              count:    { type: integer }
+              active:
+                oneOf:
+                  - { $ref: '#/components/schemas/RunEnvelope' }
+                  - { type: 'null' }
+
+    RunError:
+      description: The run raised (dispatch failure, not a task-level failure)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+    StopResult:
+      description: E-stop dispatched (the executor reports its own outcome)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:         { type: boolean }
+              cell_id:         { type: string }
+              reason:          { type: string }
+              interrupted_run:
+                oneOf:
+                  - { $ref: '#/components/schemas/RunEnvelope' }
+                  - { type: 'null' }
+
+    TasksList:
+      description: Programs available on a cell
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:  { type: boolean }
+              cell_id:  { type: string }
+              programs:
+                type: array
+                items: { type: string }
+              count:      { type: integer }
+              operations:
+                description: Optional per-program summary
+                type: object
+                additionalProperties: true
+
+    RecordingsList:
+      description: Recording index for a cell
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              cell_id: { type: string }
+              recordings:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    tree_id:    { type: string }
+                    size_bytes: { type: integer }
+
+    ReasoningTrace:
+      description: Ordered LLM reasoning + tool-call trace
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:        { type: boolean }
+              cell_id:        { type: string }
+              run_id:         { type: string }
+              program:        { type: [string, 'null'] }
+              status:         { type: string, enum: [running, succeeded, failed] }
+              model:          { type: [string, 'null'] }
+              entries:
+                type: array
+                items: { $ref: '#/components/schemas/ReasoningEntry' }
+              total_entries:  { type: integer }
+              truncated:      { type: boolean }
+              note:           { type: string }
+
+    BadRequest:
+      description: Missing/invalid field
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+    NotFound:
+      description: Nothing here
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+    CellBusy:
+      description: |
+        Another run is already holding this cell. Refused, not queued —
+        interleaving two motion commands would let two schedulers drive one
+        cell each, each unaware of the other's gates.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - type: object
+                properties:
+                  active_run: { $ref: '#/components/schemas/RunEnvelope' }
+
+    UpstreamUnreachable:
+      description: Dashboard proxy could not reach the orchestrator
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+
+    RunTaskRequest:
+      type: object
+      required: [program]
+      properties:
+        cell_id: { type: string, description: "Defaults to the orchestrator's configured cell" }
+        program: { type: string, description: "Program name (a file under cells/{cell_id}/tasks/)" }
+        model:   { type: string, description: "LLM alias or full model id — see GET /a2a/models" }
+        async:   { type: boolean, default: false, description: "Return 202 + envelope; poll /a2a/result/{run_id}" }
+
+    TaskSubmitRequest:
+      description: |
+        A task program per `skills/orchestrator/run-welding-program/references/
+        task-json-format.md`, PLUS the control fields that describe how to run
+        it. Control fields (`model`, `async`, `overwrite`, `run_id`) are
+        stripped from what gets persisted to disk.
+      type: object
+      required: [program, operations]
+      properties:
+        program:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          description: "Becomes a filename — letters, digits, dot, underscore, hyphen; ≤64 chars."
+        cell_id:   { type: string }
+        operations:
+          type: array
+          minItems: 1
+          items: { type: object, additionalProperties: true }
+        planning:  { type: object, additionalProperties: true }
+        overwrite: { type: boolean, default: false }
+        model:     { type: string }
+        async:     { type: boolean, default: false }
+
+    StopRequest:
+      type: object
+      properties:
+        cell_id: { type: string }
+        reason:  { type: string, default: "operator stop via A2A" }
+
+    PlanRequest:
+      type: object
+      required: [program]
+      properties:
+        cell_id: { type: string, description: "Defaults to the orchestrator's configured cell" }
+        program: { type: string, description: "Program name (a file under cells/{cell_id}/tasks/)" }
+        model:   { type: string, description: "LLM alias or full model id — see GET /a2a/models" }
+        backend: { type: string, description: "Motion planner for this plan (`ompl` in production); overrides the program's own constraint" }
+        backend_options:
+          type: object
+          additionalProperties: { type: [string, number, boolean] }
+          description: "Options for the chosen backend, validated by the planner against what that backend declares (list_trajectory_backends); e.g. roboballet's {\"policy\": \"<name>\"}"
+        async:   { type: boolean, default: false, description: "Return 202 + envelope; poll /a2a/result/{run_id}" }
+        mode:    { type: string, enum: [classic, coordinated, stepwise], description: "Planning mode for this plan; omitted -> the stack default" }
+        run_skills:
+          type: array
+          maxItems: 5
+          items: { $ref: '#/components/schemas/RunSkill' }
+          description: "Temporary skills for THIS plan only (in its catalog, loadable, written nowhere). See GET /a2a/skills/template; check with POST /a2a/skills/validate."
+        skill_priorities:
+          type: object
+          additionalProperties:
+            oneOf:
+              - { type: integer, minimum: 0, maximum: 100 }
+              - type: object
+                properties:
+                  priority: { type: integer, minimum: 0, maximum: 100 }
+                  enabled:  { type: boolean }
+          description: "Re-order or switch off skills for THIS plan only (the cell's skills.yaml is not written). Required skills cannot be disabled."
+        instructions: { type: string, description: "Operator instructions put in front of the planner as binding for THIS plan; it reports any it could not meet" }
+        assignments:
+          type: object
+          additionalProperties: { type: string }
+          description: "{operation_id: robot} enforced as hard locks for THIS plan"
+
+    RunSkill:
+      type: object
+      description: |
+        A temporary skill: either the fields below, or `skill_md` (a whole
+        SKILL.md with frontmatter). It may not reuse an existing skill's name and
+        cannot be `required`; it is guidance — collision gates are code.
+      properties:
+        name:        { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,47}$' }
+        description: { type: string, maxLength: 600, description: "When to use it — what the planner reads in its catalog" }
+        content:     { type: string, maxLength: 12000, description: "Markdown instructions" }
+        priority:    { type: integer, minimum: 0, maximum: 100, default: 60 }
+        skill_md:    { type: string, description: "Alternative to the fields: a complete SKILL.md" }
+
+    ResetRequest:
+      type: object
+      properties:
+        cell_id: { type: string }
+        reason:  { type: string, default: "operator reset via A2A" }
+        async:   { type: boolean, default: false, description: "Return 202 + envelope; homing runs in the background" }
+
+    ReplayRequest:
+      type: object
+      description: |
+        Speed is NOT accepted here: the cell's velocity scale is set through
+        `/api/speed`. A speed parameter on replay would be a second knob on the
+        same setting.
+      properties:
+        cell_id:    { type: string }
+        tree_id:    { type: string, description: "Omit to replay the most recent plan" }
+        home_reset: { type: boolean, default: true }
+        model:      { type: string, description: "Only reaches the recovery reasoner if execution fails" }
+        async:      { type: boolean, default: false }
+
+    MoveRequest:
+      type: object
+      required: [robot_ns]
+      description: |
+        Provide EITHER `joint_positions` (6 angles) OR `x`, `y`, `z` (a
+        world-frame point, solved to joint angles by the trajectory agent's
+        IK before dispatch). Two targets in one request are refused with 400.
+      properties:
+        cell_id:         { type: string }
+        robot_ns:        { type: string }
+        duration_s:      { type: number, minimum: 0, default: 3.0 }
+        joint_positions:
+          type: array
+          minItems: 6
+          maxItems: 6
+          items: { type: number }
+        x: { type: number }
+        y: { type: number }
+        z: { type: number }
+        async: { type: boolean, default: false }
+
+    Skill:
+      type: object
+      properties:
+        agent:            { type: string }
+        name:             { type: string }
+        description:      { type: string }
+        priority:         { type: integer, description: Effective priority for the cell (0-100) }
+        default_priority: { type: integer, description: From SKILL.md metadata.priority }
+        enabled:          { type: boolean }
+        required:         { type: boolean, description: Cannot be disabled }
+        overridden:       { type: boolean, description: The cell's skills.yaml sets this skill }
+        category:         { type: string, nullable: true }
+        version:          { type: string, nullable: true }
+        path:             { type: string }
+
+    RunEnvelope:
+      type: object
+      description: |
+        The single shape used to describe a run — asynchronous dispatch, live
+        poll and rebuilt-from-disk. `source: "run_log"` marks an envelope
+        recovered from disk (the process that started the run has since gone
+        away); its live fields are what the log persisted.
+      properties:
+        run_id:      { type: string, description: "`{cell_id}_{YYYYMMDD}_{HHMMSS}`" }
+        cell_id:     { type: string }
+        kind:        { type: string, enum: [task, replay, move] }
+        program:     { type: [string, 'null'] }
+        status:      { type: string, enum: [running, succeeded, failed] }
+        done:        { type: boolean, description: "`true` iff status is a terminal state" }
+        started_at:  { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        elapsed_s:   { type: [number, 'null'] }
+        result:
+          description: The tool's raw result (present on completion)
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+        error:       { type: [string, 'null'] }
+        source:
+          type: string
+          enum: [run_log]
+          description: Present only for envelopes rebuilt from an on-disk log
+      required: [run_id, cell_id, status, done]
+
+    RunResultSync:
+      type: object
+      description: |
+        The sync response for a run that finished before the HTTP call did.
+        `success: false` means the run RAN AND FAILED — HTTP 200 for the
+        request; `success` describes the cell.
+      properties:
+        success:    { type: boolean }
+        run_id:     { type: string }
+        elapsed_s:  { type: number }
+        model:      { type: string }
+        result:     { type: [string, 'null'] }
+        error:      { type: [string, 'null'] }
+        log_files:
+          type: object
+          properties:
+            json:     { type: string }
+            markdown: { type: string }
+      required: [success, run_id]
+
+    ReasoningEntry:
+      type: object
+      properties:
+        seq:    { type: integer, minimum: 1 }
+        role:   { type: string, description: "user, assistant, tool, ..." }
+        msg:    { type: string, description: "Text content, or a `→ toolA, toolB` summary if the assistant only called tools" }
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              name:      { type: string }
+              arguments:
+                oneOf:
+                  - { type: object, additionalProperties: true }
+                  - { type: string }
+        tool_name: { type: string, description: "Present on tool-response entries" }
+      required: [seq, role, msg]
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, enum: [false] }
+        error:   { type: string }
+        hint:    { type: string }
+        run_id:  { type: string }
+      required: [error]

@@ -1,0 +1,462 @@
+{
+  "program": "car_door_spot_welding",
+  "cell_id": "welding_cell_2_small",
+  "version": "1.0.0",
+  "description": "2x KUKA KR240 R2900-2 robots, spot-welding program for the FIXTURE_A car-door fixture. SYNTHETIC TARGETS: the 15 weld points are a 3x5 grid (x -1.15 / -0.975 / -0.8, y -1.8 .. -0.65, z 1.35) that is not derived from part CAD; the nearest sheet geometry in the fixture CAD lies about 0.2-0.4 m below them and no workpiece is modelled (no obstacle is_workpiece). W10, W13, W14 and W15 were moved off the grid away from the fixture voxels (placeholder: true, original_position = grid point) and need real CAD positions. Position and tool orientation are planned as SEPARATE stages: 'orientation' is vertical (top-down) so the motion between welds keeps the tool pointing down; 'weld_orientation' encodes the required lean and is applied by the planner as a terminal wrist adjustment AT each weld. The two outer columns lean 45 degrees (tool body outboard, electrode pointing inboard and down); the central column is vertical. approach_vector is the direction the TCP travels INTO the weld.",
+  "trajectory_backend": "ompl",
+  "extensions": {
+    "strategy": {
+      "parallel_within_group": true,
+      "sequence_groups_order": [
+        "structural",
+        "secondary"
+      ],
+      "collision_avoidance": "collaborative_planner"
+    },
+    "cycle_time": {
+      "target_s": 20.0,
+      "max_s": 30.0
+    },
+    "weld_params": {
+      "weld_type": "spot",
+      "welding_duration_s": 2.0,
+      "approach_offset_z": 0.05,
+      "retract_offset_z": 0.05,
+      "weld_phases": [
+        {
+          "phase": "approach",
+          "type": "move"
+        },
+        {
+          "phase": "contact",
+          "type": "move"
+        },
+        {
+          "phase": "squeeze",
+          "type": "wait",
+          "duration_s": 0.1
+        },
+        {
+          "phase": "weld",
+          "type": "weld_pulse",
+          "duration_s": 2.0
+        },
+        {
+          "phase": "hold",
+          "type": "wait",
+          "duration_s": 0.1
+        },
+        {
+          "phase": "retract",
+          "type": "move"
+        }
+      ]
+    }
+  },
+  "operations": [
+    {
+      "id": "W01",
+      "type": "weld",
+      "position": [
+        -1.15,
+        -1.8,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": 0.923877,
+        "z": 0.0,
+        "w": -0.382689
+      }
+    },
+    {
+      "id": "W02",
+      "type": "weld",
+      "position": [
+        -0.975,
+        -1.8,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      }
+    },
+    {
+      "id": "W03",
+      "type": "weld",
+      "position": [
+        -0.8,
+        -1.8,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.382671,
+        "z": 0.0,
+        "w": 0.923885
+      }
+    },
+    {
+      "id": "W04",
+      "type": "weld",
+      "position": [
+        -1.15,
+        -1.5125,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": 0.923877,
+        "z": 0.0,
+        "w": -0.382689
+      }
+    },
+    {
+      "id": "W05",
+      "type": "weld",
+      "position": [
+        -0.975,
+        -1.5125,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      }
+    },
+    {
+      "id": "W06",
+      "type": "weld",
+      "position": [
+        -0.8,
+        -1.5125,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.382671,
+        "z": 0.0,
+        "w": 0.923885
+      }
+    },
+    {
+      "id": "W07",
+      "type": "weld",
+      "position": [
+        -1.15,
+        -1.225,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "secondary",
+      "priority": 2,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": 0.923877,
+        "z": 0.0,
+        "w": -0.382689
+      }
+    },
+    {
+      "id": "W08",
+      "type": "weld",
+      "position": [
+        -0.975,
+        -1.225,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "secondary",
+      "priority": 2,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      }
+    },
+    {
+      "id": "W09",
+      "type": "weld",
+      "position": [
+        -0.8,
+        -1.225,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "secondary",
+      "priority": 2,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.382671,
+        "z": 0.0,
+        "w": 0.923885
+      }
+    },
+    {
+      "id": "W10", "placeholder": true,
+      "type": "weld",
+      "position": [-1.075, -0.9375, 1.4], "original_position": [-1.15, -0.9375, 1.35], "position_note": "moved clear of fixture (no CAD); replace with CAD value",
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": 0.923877,
+        "z": 0.0,
+        "w": -0.382689
+      }
+    },
+    {
+      "id": "W11",
+      "type": "weld",
+      "position": [
+        -0.975,
+        -0.9375,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      }
+    },
+    {
+      "id": "W12",
+      "type": "weld",
+      "position": [
+        -0.8,
+        -0.9375,
+        1.35
+      ],
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.382671,
+        "z": 0.0,
+        "w": 0.923885
+      }
+    },
+    {
+      "id": "W13", "placeholder": true,
+      "type": "weld",
+      "position": [-1.275, -0.65, 1.35], "original_position": [-1.15, -0.65, 1.35], "position_note": "moved clear of fixture (no CAD); replace with CAD value",
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": 0.923877,
+        "z": 0.0,
+        "w": -0.382689
+      }
+    },
+    {
+      "id": "W14", "placeholder": true,
+      "type": "weld",
+      "position": [-0.975, -0.725, 1.475], "original_position": [-0.975, -0.65, 1.35], "position_note": "moved clear of fixture (no CAD); replace with CAD value",
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      }
+    },
+    {
+      "id": "W15", "placeholder": true,
+      "type": "weld",
+      "position": [-0.9, -0.575, 1.5], "original_position": [-0.8, -0.65, 1.35], "position_note": "moved clear of fixture (no CAD); replace with CAD value",
+      "approach_vector": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "orientation": {
+        "x": 0.0,
+        "y": -0.7071,
+        "z": 0.0,
+        "w": 0.7071
+      },
+      "sequence_group": "structural",
+      "priority": 1,
+      "weld_orientation": {
+        "x": 0.0,
+        "y": -0.382671,
+        "z": 0.0,
+        "w": 0.923885
+      }
+    }
+  ]
+}

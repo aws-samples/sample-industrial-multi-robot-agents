@@ -1,0 +1,253 @@
+## multi_robots_agents docker-compose — BASE FILE
+##
+## ⚠️  Do NOT use this file directly.
+## Use `make sim SIM=<cell_id>` which auto-generates a cell-specific compose
+## (scripts/generate_compose.py reads the cell's robots.yaml and creates one
+##  robot-agent service per robot).
+##
+## Example:
+##   make sim SIM=welding_cell_2_small
+##
+## The generated file is written to .generated_compose.yml and used automatically.
+##
+## Environment variables:
+##   SIM                — cell directory under cells/    (default: welding_cell_2_small)
+##   TRAJECTORY_BACKEND — ompl | rrt | ompl-compound    (default: ompl)
+##   LLM_PROVIDER       — bedrock | openai | ollama      (default: bedrock)
+##   LLM_MODEL          — startup LLM: an alias (opus-5 | opus-4.8 | sonnet-5 |
+##                        haiku), a full model id, or provider:model
+##                                                       (default: opus-5)
+##   RMW                — ROS 2 middleware: cyclonedds | zenoh
+##                                                       (default: cyclonedds)
+##   ZENOH_ROUTER       — endpoint of the EXISTING Zenoh broker to connect to,
+##                        e.g. tcp/broker.plant.local:7447. Required with
+##                        RMW=zenoh; this stack runs no router of its own.
+##
+## RMW is honoured only by the GENERATED file — agents/middleware.py resolves it
+## and writes the transport env into every service. The anchor below is fixed at
+## CycloneDDS, which is one more reason not to use this file directly.
+
+x-ros-env: &ros-env
+  ROS_DOMAIN_ID: "42"
+  RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+  # Per-cell DDS config, resolved from the SIM cell name under CELL_BASE_PATH.
+  # Read only under CycloneDDS; a generated Zenoh stack omits this entirely
+  # rather than carrying config that reads as live and is not.
+  #
+  # A CONVERTED cell keeps its config at agentic_planner/config/, so this literal
+  # points at agentic_planner/config/, where welding_cell_2_small keeps it. Compose
+  # cannot probe the tree; the generated file can, and computes the URI with
+  # cell_layout.config_uri — one more reason not to use this file directly.
+  CYCLONEDDS_URI: file:///cells/${SIM:-welding_cell_2_small}/agentic_planner/config/cyclonedds.xml
+  CELL_BASE_PATH: /cells
+
+x-llm-env: &llm-env
+  LLM_PROVIDER: ${LLM_PROVIDER:-bedrock}
+  # The startup default for every agent. An ALIAS, not a model id: agents/llm_model.py
+  # expands it and derives the Bedrock inference-profile prefix from the region, so
+  # this stays correct outside Ireland. The old BEDROCK_MODEL_ID default pinned both
+  # a model (Sonnet 5) and a region prefix (eu.) here, which is rejected outright
+  # when BEDROCK_REGION is not an eu-* region.
+  LLM_MODEL: ${LLM_MODEL:-opus-5}
+  # Legacy fallback, consulted only when LLM_MODEL is unset. No default here: a
+  # value baked in at this layer would shadow the alias above for every deployment.
+  BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-}
+  # BEDROCK_REGION pins Bedrock to Ireland; agents prefer it over AWS_REGION.
+  BEDROCK_REGION: ${BEDROCK_REGION:-eu-west-1}
+  AWS_REGION: ${AWS_REGION:-eu-west-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+
+services:
+
+  # ── Trajectory Agent ─────────────────────────────────────────────────────
+  trajectory-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    image: multi-robots-agents/app:latest
+    container_name: trajectory-agent
+    command:
+      - "source /opt/ros/humble/setup.bash && python3 agents/trajectory/mcp_server.py"
+    environment:
+      <<: [*ros-env, *llm-env]
+      CELL_ID: ${SIM:-welding_cell_2_small}
+      TRAJ_MCP_PORT: "8890"
+      TRAJECTORY_BACKEND: ${TRAJECTORY_BACKEND:-ompl}
+      # Out-of-repo backends, "name=module:attr,..." — code under plugins/.
+      TRAJECTORY_BACKEND_PLUGINS: "${TRAJECTORY_BACKEND_PLUGINS:-}"
+      # Everything derived — plans, traces, events, quality logs, task programs,
+      # obstacles.yaml, robots.yaml — is read and written through the
+      # orchestrator's cell-data MCP, the process that owns /cells.
+      CELL_DATA_MODE: orchestrator
+      ORCHESTRATOR_HOST: "orchestrator"
+      ORCH_MCP_PORT: "8893"
+      # The containers start together: keep retrying a REFUSED connection this
+      # long while the orchestrator comes up, instead of failing the first call.
+      CELL_STORE_CONNECT_RETRY_S: "20"
+      # 1 on a planning-only stack (make sim ONLY=trajectory): no ROS graph.
+      DDS_DISABLED: "${DDS_DISABLED:-0}"
+      # Model for trajectory PLANNING only; empty = the code default (Sonnet,
+      # agents/llm_model.planning_model). A request's own `model` still wins.
+      PLANNING_LLM_MODEL: "${PLANNING_LLM_MODEL:-}"
+      # Default planning mode for requests naming none; empty = classic.
+      PLANNING_MODE: "${PLANNING_MODE:-}"
+      # Independent OMPL solves of one problem run at once in forked children
+      # (ompl + ompl-compound); 0 = one after another.
+      OMPL_PARALLEL_CANDIDATES: "${OMPL_PARALLEL_CANDIDATES:-1}"
+      # The four arms' returns HOME planned at once, kept only when the gate runs
+      # them together; 0 = the coupled one-after-another planner only.
+      HOME_PARALLEL_FASTPATH: "${HOME_PARALLEL_FASTPATH:-1}"
+      # Reuse an unchanged task's allocation across runs (config-fingerprinted).
+      PLAN_MEMO_PROCESS: "${PLAN_MEMO_PROCESS:-1}"
+      # Across runs, kept in the cell's recordings (tools/experience_store.py):
+      # a planned step reused when nothing it depends on changed, re-checked first;
+      # and past search paths offered (checked) to the search as candidates.
+      PLAN_LEG_STORE: "${PLAN_LEG_STORE:-1}"
+      PLAN_EXPERIENCE: "${PLAN_EXPERIENCE:-1}"
+      # Compiled collision kernels (tools/fastgeom.py): 0 = NumPy path. Their
+      # machine code is cached on the persistent scratch volume across restarts.
+      NUMBA_GEOM: "${NUMBA_GEOM:-1}"
+      NUMBA_CACHE_DIR: /scratch/numba_cache
+      # The only thing this container keeps on its own disk: unfinished runs.
+      PLANNER_SCRATCH_PATH: /scratch
+    ports:
+      # Unauthenticated endpoints answer this machine only unless PUBLISH_HOST
+      # opens them; :8892 and :8893 (the split-deployment contract) always
+      # listen on every interface. See scripts/generate_compose.py.
+      - "${PUBLISH_HOST:-127.0.0.1}:8890:8890"
+    volumes:
+      # READ-ONLY on purpose. The scene bundle (URDF/SRDF/meshes/scene.yaml) is
+      # shared immutable input whose mesh URIs are resolved by other processes, so
+      # it stays a mount; everything the planner derives now goes to its owner.
+      - ./cells:/cells:ro
+      # A paused run's checkpoint — the model's conversation plus trajectories
+      # solved but not yet committed. Nobody else's to read.
+      - planner-scratch:/scratch
+    networks:
+      - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8890/health"]
+      interval: 10s
+      retries: 5
+
+  # ── Orchestrator ──────────────────────────────────────────────────────────
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    image: multi-robots-agents/app:latest
+    container_name: orchestrator
+    command:
+      - "source /opt/ros/humble/setup.bash && python3 agents/orchestrator/server.py"
+    environment:
+      <<: [*ros-env, *llm-env]
+      CELL_ID: ${SIM:-welding_cell_2_small}
+      ORCHESTRATOR_PORT: "8889"
+      TRAJECTORY_AGENT_HOST: "trajectory-agent"
+      TRAJECTORY_AGENT_PORT: "8890"
+      # The cell controller's compose name on one machine, its IP/hostname when
+      # execution is deployed apart (make sim ONLY=trajectory CELL_CONTROLLER_HOST=<ip>).
+      CELL_CONTROLLER_HOST: "${CELL_CONTROLLER_HOST:-cell-controller}"
+      CELL_MCP_PORT: "8892"
+      # The cell-data MCP, served in-process beside Flask: this is the container
+      # that holds /cells read-write, so this is where the door to it lives.
+      ORCH_MCP_PORT: "8893"
+    ports:
+      - "${PUBLISH_HOST:-127.0.0.1}:8889:8889"
+      - "8893:8893"
+    volumes:
+      - ./cells:/cells   # read-write: the orchestrator OWNS the cell's derived data
+    depends_on:
+      trajectory-agent:
+        condition: service_healthy
+    networks:
+      - agent-net
+
+  # ── Cell Agent ────────────────────────────────────────────────────────────
+  cell-controller:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    image: multi-robots-agents/app:latest
+    container_name: cell-controller
+    command:
+      - "source /opt/ros/humble/setup.bash && python3 agents/cell/mcp_server.py"
+    environment:
+      <<: [*ros-env, *llm-env]
+      CELL_ID: ${SIM:-welding_cell_2_small}
+      CELL_HTTP_PORT: "8891"
+      CELL_MCP_PORT: "8892"
+      # Plans and cell config through the orchestrator's cell-data MCP — on one
+      # machine or across two (make sim ONLY=execution ORCHESTRATOR_HOST=<ip>).
+      CELL_DATA_MODE: orchestrator
+      ORCHESTRATOR_HOST: "${ORCHESTRATOR_HOST:-orchestrator}"
+      ORCH_MCP_PORT: "8893"
+      CELL_STORE_CONNECT_RETRY_S: "20"
+      # Opt-in lockstep for ompl-compound steps (make LOCKSTEP=1).
+      LOCKSTEP: "${LOCKSTEP:-0}"
+    ports:
+      - "${PUBLISH_HOST:-127.0.0.1}:8891:8891"
+      - "8892:8892"
+    volumes:
+      - ./cells:/cells
+    networks:
+      - agent-net
+
+  # ── Robot Agents (cell-specific, generated by scripts/generate_compose.py) ──
+  # Robot-agent services are NOT defined here. They are generated dynamically
+  # from the cell's robots.yaml by `make sim SIM=<cell>` and written to
+  # .generated_compose.yml. One container is started per robot namespace.
+  web-panel:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    image: multi-robots-agents/app:latest
+    container_name: web-panel
+    command:
+      - "source /opt/ros/humble/setup.bash && python3 dashboard/web_control_panel.py"
+    environment:
+      <<: [*ros-env, *llm-env]
+      CELL_ID: ${SIM:-welding_cell_2_small}
+      # The planner's compose name on one machine, the planning machine when the
+      # panel runs with the execution side (make sim ONLY=execution).
+      TRAJECTORY_AGENT_HOST: "${TRAJECTORY_AGENT_HOST:-trajectory-agent}"
+      TRAJECTORY_AGENT_PORT: "8890"
+      ORCHESTRATOR_HOST: "${ORCHESTRATOR_HOST:-orchestrator}"
+      CELL_CONTROLLER_HOST: "${CELL_CONTROLLER_HOST:-cell-controller}"
+      ORCHESTRATOR_PORT: "8889"
+    ports:
+      - "${PUBLISH_HOST:-127.0.0.1}:8888:8888"
+      - "${PUBLISH_HOST:-127.0.0.1}:8765:8765"
+    depends_on:
+      - orchestrator
+    networks:
+      - agent-net
+
+  # ── RViz Web (optional, profile: rviz) ────────────────────────────────────
+  rviz-web:
+    image: tiryoh/ros2-desktop-vnc:humble
+    container_name: rviz-web
+    profiles:
+      - rviz
+    environment:
+      # The robot descriptions come from the trajectory agent's MCP.
+      TRAJECTORY_AGENT_HOST: "${TRAJECTORY_AGENT_HOST:-trajectory-agent}"
+      TRAJECTORY_AGENT_PORT: "8890"
+      <<: *ros-env
+    ports:
+      - "6080:80"
+    volumes:
+      - ./cells:/cells:ro   # provides the cell's cyclonedds.xml
+    networks:
+      - agent-net
+
+networks:
+  agent-net:
+    driver: bridge
+
+volumes:
+  # The planner's private scratch. Named rather than a bind mount because an
+  # unfinished run belongs to the worker still working on it.
+  planner-scratch: {}

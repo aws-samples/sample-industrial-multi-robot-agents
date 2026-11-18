@@ -1,0 +1,21 @@
+## ExecuteOperation.action — cell agent → robot agent
+
+# Goal
+string cell_id
+string robot_ns
+string operation_id
+string operation_type
+string trajectory_json
+float32 hold_duration_s
+float32 velocity_scale
+---
+# Result
+bool success
+string operation_id
+float32 elapsed_s
+string error_message
+---
+# Feedback
+float32 progress          # 0.0–1.0
+float64[3] ee_position
+string status             # moving | holding | homing

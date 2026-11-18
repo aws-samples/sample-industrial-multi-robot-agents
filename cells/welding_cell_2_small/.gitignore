@@ -1,0 +1,5 @@
+# Robot meshes and the floor-plan OBJ are not shipped with this sample.
+# Place them here locally (robots/<robot>/meshes/, meshes_lowres/, floorplans/).
+robots/*/meshes/
+robots/*/meshes_lowres/
+floorplans/

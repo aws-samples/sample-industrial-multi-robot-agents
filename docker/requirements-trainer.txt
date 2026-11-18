@@ -1,0 +1,12 @@
+# The policy trainer's image (docker/Dockerfile.trainer). It prepares, starts,
+# monitors and imports RoboBallet training jobs — on SageMaker or locally — and
+# runs the local ones itself. No ROS, no Pinocchio, no OMPL, no LLM stack: it
+# reads cells through utils/cell_store + cell_layout (stdlib + PyYAML) and the
+# policy core is numpy.
+#
+# torch is installed separately by the Dockerfile (CPU wheel index by default).
+mcp>=1.0.0,<2
+uvicorn>=0.30
+pyyaml>=6
+numpy>=1.26
+boto3>=1.34

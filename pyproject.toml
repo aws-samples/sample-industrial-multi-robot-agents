@@ -1,0 +1,15 @@
+[project]
+name = "multi-robots-agents"
+version = "0.1.0"
+description = "Agentic multi-robot cell planning + execution (LangChain Deep Agents + MCP over docker compose)."
+readme = "README.md"
+# ROS 2 Jazzy runs on Ubuntu 24.04 (Noble) → Python 3.12, so that is the floor for
+# everything here, including docker/Dockerfile.tools.
+requires-python = ">=3.12"
+
+# Deliberately empty. Nothing in this repo is installed on a host interpreter: the
+# Makefile runs every script and every test inside the image built from
+# docker/Dockerfile.tools (see its requirements-tools.txt), and the agent services
+# install docker/requirements.txt. This file stays because it carries the project
+# metadata and anchors pytest's rootdir — not because anything resolves deps from it.
+dependencies = []

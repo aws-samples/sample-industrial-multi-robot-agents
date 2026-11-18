@@ -1,0 +1,93 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Test / analysis caches
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# Generated compose + build artifacts
+.generated_compose.yml
+docker-compose.*.generated.yml
+# Records the settings the compose file was generated from, so changing RMW /
+# LLM_MODEL / backend regenerates it instead of silently reusing a stale stack.
+.compose_settings
+# Marks that the Python runner image (docker/Dockerfile.tools) has been built, so
+# make rebuilds it only when the Dockerfile or its requirements change.
+.tools_image
+build/
+
+# Runtime output (per-cell logs and recordings). Two forms: the agent workspace
+# introduced with agentic_planner/, and the flat layout kept by cells that were
+# never migrated (welding_cell_2_small is a read-only archive).
+cells/*/agentic_planner/logs/
+cells/*/agentic_planner/recordings/*.rrd
+cells/*/logs/
+cells/*/recordings/*.rrd
+# Whole recordings directories, not just the .rrd payloads: a recording's
+# sidecars are runtime output too.
+cells/*/agentic_planner/recordings/
+cells/*/recordings/
+
+# Simulation source assets (~1 GB of captures and meshes we do not own and do not
+# build from). Cells commit their own converted meshes; this staging area is not
+# a cell.
+cells/cellsim-assets/
+
+# Editor / OS
+.DS_Store
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+# Additional Python build/dist artifacts
+*.egg
+dist/
+*.so
+pip-wheel-metadata/
+# Generated plans (per-cell precomputed trajectories, runtime output)
+cells/*/agentic_planner/plans/
+cells/*/plans/
+# Temporary / editor files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.swp
+*.swo
+*~
+.*.swp
+# macOS
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+# IDE
+.idea/
+*.iml
+
+# Large Isaac USD scene exports (kept locally; exceed GitHub's 100MB file limit)
+cells/*/scene/*.usda
+
+# Local credentials / secrets for docker compose interpolation (never commit)
+.env
+.env.local
+_tmp_env_check.py
+# Trajectory backends from other repositories live in their own repos.
+plugins/*
+!plugins/README.md

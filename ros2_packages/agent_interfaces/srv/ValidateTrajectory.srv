@@ -1,0 +1,13 @@
+## ValidateTrajectory.srv — request trajectory validation from trajectory agent
+
+string cell_id
+string robot1_ns
+string trajectory1_json    # [{"positions": [j1..j6], "time_s": float}]
+string robot2_ns
+string trajectory2_json
+float32 collision_radius_m  # default 0.12
+---
+bool collision_free
+float32 min_clearance_m
+float32 collision_time_s    # -1 if no collision
+string suggestion

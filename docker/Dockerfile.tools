@@ -1,0 +1,71 @@
+## Runner image for every Python the Makefile invokes.
+##
+## Nothing in this repo's make targets runs on the host interpreter. The Makefile
+## bind-mounts the repo into this image and executes the scripts inside it, so a
+## clone plus Docker is the whole prerequisite list — no host Python, no venv, no
+## `pip install`, no `uv`.
+##
+## Why this is NOT the agent image (docker/Dockerfile): the agent image is built
+## from the generated compose file, and generate_compose.py is what produces that
+## file. The image that runs the generator therefore cannot be the image the
+## generator's output builds. This one depends on nothing in the repo and is a few
+## hundred MB against the agent image's multi-GB ROS base.
+##
+## Build (the Makefile does this automatically, once, and caches it):
+##   docker build -f docker/Dockerfile.tools -t multi-robots-agents/tools:latest docker/
+##
+## The build context is docker/ — the only file needed is requirements-tools.txt,
+## so the repo is never sent to the daemon.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# The docker CLI, client only — no daemon. tests/test_ompl_backend_container.py
+# shells out to `docker run` and SKIPS ITSELF when the binary is absent
+# (`shutil.which("docker")`), so without this the containerised
+# `make test-ompl-container` would report success while testing nothing. The
+# Makefile mounts the host's docker socket for that one target, so builds and runs
+# land on the host daemon and the image the test looks for is the image it built.
+#
+# Installed as the upstream static binary rather than Debian's `docker.io`, which
+# would drag in the daemon, containerd and runc for a client-only need.
+ARG DOCKER_CLI_VERSION=27.3.1
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) arch=x86_64 ;; \
+      arm64) arch=aarch64 ;; \
+      *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${arch}/docker-${DOCKER_CLI_VERSION}.tgz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 docker/docker; \
+    docker --version; \
+    apt-get purge -y --auto-remove curl; \
+    rm -rf /var/lib/apt/lists/*
+
+# Node, for the dashboard JavaScript tests. tests/test_dashboard_script_loads.py
+# and tests/test_btree_tab_and_weld_log.py shell out to `node` to load the real
+# dashboard script, and SKIP when it is missing ("node not installed") — 27 tests
+# that passed on the host would silently stop running without this. Only the
+# interpreter is needed; the tests write their own throwaway harness, so npm and a
+# package.json are not involved.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nodejs; \
+    node --version; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements-tools.txt /tmp/requirements-tools.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-tools.txt
+
+# Every run is `docker run -u <host uid>:<host gid>`, so the container has no
+# passwd entry and no home. Some libraries expand ~ at import; point it somewhere
+# world-writable so they cannot fail on it.
+ENV HOME=/tmp
+
+# Overridden per invocation: the Makefile mounts the repo at its own host path and
+# sets -w to match, so relative and absolute paths resolve as they do on the host.
+WORKDIR /work

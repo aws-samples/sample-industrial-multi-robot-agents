@@ -1,0 +1,55 @@
+# Dependencies for docker/Dockerfile.tools — the image every Python invocation in
+# the Makefile runs inside. Nothing in this file is ever installed on the host.
+#
+# ─── Why this is NOT `-r requirements.txt` ────────────────────────────────────
+#
+# The tempting move is to install the agent runtime here so `make test` exercises
+# the real stack. It does not work, and the reason is in the tests: the suite is
+# written to run WITHOUT the LLM stack, and several modules install
+# `types.ModuleType` stubs into sys.modules to make that possible —
+# tests/test_multi_robot_arity.py, tests/trajectory/test_allocation_and_pairing.py
+# and tests/trajectory/test_reallocation.py all do
+#
+#     if "langchain_core.tools" not in sys.modules:
+#         sys.modules.setdefault("langchain_core", types.ModuleType(...))
+#
+# With langchain-core actually installed but not yet imported, that guard still
+# fires and the bare stub SHADOWS the real package. Anything importing
+# langchain_core afterwards dies on "'langchain_core' is not a package", and a
+# collection error aborts the whole pytest run — measured: 5 collection errors,
+# 0 tests run. The stubs are load-bearing, so the image honours them and leaves
+# the LLM stack out. Integrated coverage comes from the agent image itself and
+# from `make test-ompl-container`.
+#
+# So the list below mirrors what the suite actually ran against before it was
+# containerised, which keeps the pass/fail set comparable.
+
+# ─── The make helper scripts ──────────────────────────────────────────────────
+# generate_compose.py, convert_isaac_scene.py, generate_cell_urdfs.py parse cell
+# config; cell_mcp.py speaks HTTP and MCP to the running stack.
+pyyaml>=6.0
+httpx>=0.27.0
+# Pinned <2 for the same reason as docker/requirements.txt: the agents build on
+# mcp.server.fastmcp, which mcp 2.0 removed.
+mcp>=1.0.0,<2
+
+# ─── The test suite ───────────────────────────────────────────────────────────
+pytest>=8.0.0
+hypothesis>=6.0.0
+jinja2>=3.1.0
+
+# NumPy <2 to match docker/requirements.txt: the agent image's pinocchio/eigenpy
+# bindings are built against the 1.x ABI, and this image is only useful if its
+# results are comparable with that one.
+numpy>=1.24.0,<2
+
+# ─── Deliberately absent ──────────────────────────────────────────────────────
+# flask, langchain*, langgraph  — see the stub explanation above. Without flask the
+#   two orchestrator HTTP test modules hit their `pytest.importorskip("flask")` and
+#   skip, exactly as they did on the host, instead of erroring on the stubs.
+# pinocchio, ompl, toppra, scipy — apt/wheel installs on a ROS base (see
+#   docker/Dockerfile, docker/Dockerfile.ompltest) or a source build needing a C
+#   toolchain. All three are soft-imported behind try/except, so the tests that
+#   need them skip; pulling them in would make this a multi-GB image.
+# rerun-sdk — the recording writer runs in the agent image, which has it. The
+#   tests that touch .rrd output skip without it.

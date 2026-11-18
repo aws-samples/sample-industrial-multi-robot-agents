@@ -1,0 +1,46 @@
+## Focused image for the OMPL trajectory-backend container test.
+##
+## This is NOT the full application image — it carries only what the OMPL
+## backend imports at runtime (Pinocchio + the minimal Python deps + the `ompl`
+## Python bindings). It mirrors the `pip install ompl` install path from
+## docker/Dockerfile so the test validates the same mechanism used in production,
+## while building far faster (no LangGraph / Bedrock / rerun stack).
+##
+## Build:
+##   docker build -f docker/Dockerfile.ompltest -t multi-robots-agents/ompltest:latest .
+##
+## Used by tests/test_ompl_backend_container.py (client on host, backend in here).
+FROM ros:jazzy-ros-base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    CELL_BASE_PATH=/cells \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+
+# Pinocchio (FK/IK/collision math) from the ROS apt feed + pip bootstrap.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-dev \
+    python3-numpy \
+    curl \
+    ros-jazzy-pinocchio \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3
+
+# Minimal Python deps the backend imports at module load:
+#   numpy<2       — ros-jazzy-pinocchio/eigenpy is built against the NumPy 1.x ABI
+#   pyyaml        — cell config parsing
+#   langchain-core — the @tool decorators on run_ik / rrt_planner tools
+RUN pip3 install --no-cache-dir "numpy>=1.24,<2" pyyaml "langchain-core>=0.3.0"
+
+# OMPL Python bindings — the whole point of this image. Same resilient install
+# as the production Dockerfile: if no wheel is available for this platform the
+# build still succeeds and the runner reports ompl_available=false, which the
+# host test turns into an explicit, actionable failure.
+RUN pip3 install --no-cache-dir ompl \
+    || echo "[build] WARNING: 'ompl' Python wheel unavailable for this platform."
+
+WORKDIR /workspace/multi_robots_agents
+ENV PYTHONPATH=/workspace/multi_robots_agents
+ENTRYPOINT ["/bin/bash", "-c"]

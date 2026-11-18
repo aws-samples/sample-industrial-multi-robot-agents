@@ -1,0 +1,44 @@
+## The policy trainer — its own image, its own container (compose profile
+## "training"; `make trainer`).
+##
+## It is the one place that talks to SageMaker: it exports cells to scene packs,
+## bundles the training code, uploads, starts, MONITORS (a background thread,
+## agents/policy_trainer/tracker.py) and stops jobs, and imports finished
+## policies into the policy-models volume. It also runs the SAME training code
+## locally (target="local"), which is why it carries PyTorch and the planner's
+## image does not.
+##
+## Slim on purpose: no ROS base. Nothing it imports needs one.
+##
+## Build — no cell, no compose file needed (the image is the same for every cell):
+##   make trainer-build                      (TRAINER_TORCH_INDEX=cpu|cu124)
+##   docker build -f docker/Dockerfile.trainer -t multi-robots-agents/policy-trainer:latest docker/
+## The build context is docker/ — the only file needed is requirements-trainer.txt,
+## so the repo (and its cells, up to GBs) is never sent to the daemon.
+## A CUDA build for a GPU host: --build-arg TORCH_INDEX=cu124 and TRAINER_GPU=1
+## on `make trainer` so compose reserves the GPU.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/workspace/multi_robots_agents \
+    CELL_BASE_PATH=/cells
+
+ARG TORCH_INDEX=cpu
+ARG TORCH_VERSION=2.5.1
+RUN pip install --index-url "https://download.pytorch.org/whl/${TORCH_INDEX}" \
+        "torch==${TORCH_VERSION}"
+
+COPY requirements-trainer.txt /tmp/requirements-trainer.txt
+RUN pip install -r /tmp/requirements-trainer.txt
+
+# Not root: the job state and the policies it writes are plain files on volumes.
+RUN useradd --create-home --uid 10001 trainer \
+    && mkdir -p /state /models \
+    && chown trainer:trainer /state /models
+USER trainer
+
+# Code is bind-mounted read-only at run time, like every agent's.
+WORKDIR /workspace/multi_robots_agents
+ENTRYPOINT ["/bin/bash", "-c"]

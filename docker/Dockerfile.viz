@@ -1,0 +1,39 @@
+## RViz web viewer — ROS 2 Jazzy LTS (Ubuntu 24.04) + noVNC
+## Accessible via browser at http://localhost:6080/vnc.html
+FROM ros:jazzy-ros-base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:0 \
+    VNC_PORT=5900 \
+    NOVNC_PORT=80 \
+    RESOLUTION=1280x900x24
+
+# Install pip first (Ubuntu 24.04 approach)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --break-system-packages
+
+# RViz2 + desktop + VNC + noVNC
+# Both RMWs, for the same reason as docker/Dockerfile: rviz-web receives the same
+# RMW_IMPLEMENTATION as every other container, so an image missing the selected
+# one would leave the viewer unable to subscribe to a cell that is otherwise fine.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-jazzy-rviz2 \
+    ros-jazzy-rmw-cyclonedds-cpp \
+    ros-jazzy-rmw-zenoh-cpp \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    xfce4 \
+    xfce4-terminal \
+    dbus-x11 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/entrypoint_rviz.sh /entrypoint_rviz.sh
+RUN chmod +x /entrypoint_rviz.sh
+
+EXPOSE 80
+CMD ["/entrypoint_rviz.sh"]
